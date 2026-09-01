@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>RIP</title>
+<!--
+  RIP app mirror — encrypted loader.
+  The hosted repo carries ONLY ciphertext (app.enc, AES-256-GCM of the
+  gzipped app page) plus this loader and, optionally, wrap.json (the
+  content key wrapped under a PBKDF2 passphrase — same public-ciphertext
+  law as the vault blob). Decryption happens entirely in the browser:
+  passphrase or pasted key on first unlock, then per-device conveniences —
+  a PIN, or fingerprint via a WebAuthn passkey with the PRF extension
+  (the fingerprint releases a hardware-backed key that unwraps the
+  content key; nothing cosmetic). Drill results auto-backup: a shim
+  standing in for the artifact-save capability pushes the results island
+  to a PRIVATE GitHub repo using a fine-grained token stored here only
+  encrypted under the content key.
+-->
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#111a15; color:#e4ebe5;
+         font: 16px/1.5 "Segoe UI", system-ui, sans-serif;
+         display:flex; min-height:100vh; align-items:center;
+         justify-content:center; }
+  .card { width: 20rem; max-width: 92vw; background:#18231d;
+          border:1px solid #2a382f; border-radius:14px; padding:1.6rem;
+          box-shadow:0 8px 30px rgba(0,0,0,.35); }
+  h1 { font-size:1.5rem; margin:0 0 .2rem; letter-spacing:.04em; }
+  .sub { color:#9fb0a5; font-size:.85rem; margin:0 0 1.1rem; }
+  button { width:100%; padding:.7rem; margin:.3rem 0; border-radius:10px;
+           border:1px solid #2a382f; background:#1d2f26; color:#cfe3d6;
+           font-size:1rem; cursor:pointer; }
+  button.primary { background:#2e6b4e; border-color:#2e6b4e; color:#fff; }
+  button:disabled { opacity:.5; }
+  input { width:100%; padding:.65rem; margin:.3rem 0; border-radius:10px;
+          border:1px solid #2a382f; background:#111a15; color:#e4ebe5;
+          font-size:1rem; }
+  .msg { min-height:1.3rem; font-size:.85rem; color:#d99181; }
+  .ok { color:#7fbf9a; }
+  details { margin-top:.8rem; font-size:.85rem; color:#9fb0a5; }
+  details input { font-family: monospace; font-size:.85rem; }
+  .row { display:flex; gap:.5rem; }
+  .row > * { flex:1; }
+  hr { border:0; border-top:1px solid #2a382f; margin:1rem 0; }
+  .hide { display:none; }
+</style>
+</head>
+<body>
+<script type="application/json" id="rip-data">{}</script>
+<div class="card" id="card">
+  <h1>&#9823; RIP</h1>
+  <p class="sub">Private study.</p>
+  <div id="unlock"></div>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+"use strict";
+var OWNER = "postmaster87";
+var RESULTS_REPO = "rip-results";
+var STATE_PATH = "state/results-state.json";
+var LS = { pin: "ripapp:wrap-pin", prf: "ripapp:wrap-prf",
+           tok: "ripapp:wrap-tok" };
+var MAGIC = "RIPAPP1";
+
+var encBuf = null, wrapRemote = null, K = null;
+
+// ---------- small utils ----------
+function $(id) { return document.getElementById(id); }
+function msg(t, ok) { var m = $("msg"); m.textContent = t || "";
+  m.className = "msg" + (ok ? " ok" : ""); }
+function te(s) { return new TextEncoder().encode(s); }
+function b64(buf) {
+  var u = new Uint8Array(buf), s = "", CH = 0x8000;
+  for (var i = 0; i < u.length; i += CH)
+    s += String.fromCharCode.apply(null, u.subarray(i, i + CH));
+  return btoa(s);
+}
+function unb64(s) {
+  var bin = atob(s), u = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+  return u;
+}
+function rand(n) { var u = new Uint8Array(n); crypto.getRandomValues(u);
+  return u; }
+function lsGet(k) { try { var v = localStorage.getItem(k);
+  return v ? JSON.parse(v) : null; } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); }
+  catch (e) {} }
+
+// ---------- crypto ----------
+function kdfKey(secret, saltU8, iter) {
+  return crypto.subtle.importKey("raw", te(secret), "PBKDF2", false,
+    ["deriveKey"]).then(function (base) {
+      return crypto.subtle.deriveKey(
+        { name: "PBKDF2", salt: saltU8, iterations: iter, hash: "SHA-256" },
+        base, { name: "AES-GCM", length: 256 }, false,
+        ["encrypt", "decrypt"]);
+    });
+}
+function rawKey(bytes) {
+  return crypto.subtle.importKey("raw", bytes, { name: "AES-GCM" }, false,
+    ["encrypt", "decrypt"]);
+}
+function gcmEncrypt(key, dataU8) {
+  var nonce = rand(12);
+  return crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, key, dataU8)
+    .then(function (ct) { return { n: b64(nonce), c: b64(ct) }; });
+}
+function gcmDecrypt(key, wrap) {
+  return crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(wrap.n) },
+    key, unb64(wrap.c));
+}
+
+// ---------- boot ----------
+Promise.all([
+  fetch("app.enc", { cache: "no-cache" }).then(function (r) {
+    if (!r.ok) throw new Error("app.enc " + r.status);
+    return r.arrayBuffer();
+  }),
+  fetch("wrap.json", { cache: "no-cache" })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .catch(function () { return null; })
+]).then(function (got) {
+  encBuf = new Uint8Array(got[0]);
+  var head = String.fromCharCode.apply(null, encBuf.subarray(0, MAGIC.length));
+  if (head !== MAGIC) { msg("app.enc is not a RIP blob"); return; }
+  wrapRemote = got[1];
+  renderUnlock();
+}).catch(function (e) { msg("Load failed: " + e.message); });
+
+function tryKey(kBytes) {
+  return rawKey(kBytes).then(function (key) {
+    var nonce = encBuf.subarray(MAGIC.length, MAGIC.length + 12);
+    var ct = encBuf.subarray(MAGIC.length + 12);
+    return crypto.subtle.decrypt({ name: "AES-GCM", iv: nonce }, key, ct);
+  });
+}
+
+// ---------- unlock UI ----------
+function renderUnlock() {
+  var u = $("unlock"); u.innerHTML = "";
+  var pin = lsGet(LS.pin), prf = lsGet(LS.prf);
+
+  if (prf && window.PublicKeyCredential) {
+    var fb = document.createElement("button");
+    fb.className = "primary"; fb.textContent = "Unlock with fingerprint";
+    fb.onclick = function () { prfUnlock(prf); };
+    u.appendChild(fb);
+  }
+  if (pin) {
+    var pi = document.createElement("input");
+    pi.type = "password"; pi.inputMode = "numeric";
+    pi.placeholder = "PIN"; pi.autocomplete = "off";
+    var pb = document.createElement("button");
+    pb.textContent = "Unlock with PIN";
+    pb.onclick = function () { pinUnlock(pin, pi.value); };
+    pi.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") pb.click(); });
+    u.appendChild(pi); u.appendChild(pb);
+  }
+  if (wrapRemote && !pin && !prf) {
+    var si = document.createElement("input");
+    si.type = "password"; si.placeholder = "Passphrase";
+    si.autocomplete = "off";
+    var sb = document.createElement("button");
+    sb.className = (prf || pin) ? "" : "primary";
+    sb.textContent = "Unlock with passphrase";
+    sb.onclick = function () { passUnlock(si.value); };
+    si.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") sb.click(); });
+    u.appendChild(si); u.appendChild(sb);
+  } else if (wrapRemote) {
+    var d1 = document.createElement("details");
+    d1.innerHTML = "<summary>Use passphrase instead</summary>";
+    var si2 = document.createElement("input");
+    si2.type = "password"; si2.placeholder = "Passphrase";
+    var sb2 = document.createElement("button");
+    sb2.textContent = "Unlock";
+    sb2.onclick = function () { passUnlock(si2.value); };
+    d1.appendChild(si2); d1.appendChild(sb2);
+    u.appendChild(d1);
+  }
+  var adv = document.createElement("details");
+  adv.innerHTML = "<summary>Advanced: content key</summary>";
+  var ki = document.createElement("input");
+  ki.type = "password"; ki.placeholder = "Content key (base64 or hex)";
+  ki.autocomplete = "off";
+  var kb = document.createElement("button");
+  kb.textContent = "Unlock with key";
+  kb.onclick = function () {
+    var v = ki.value.trim(), bytes = null;
+    try {
+      if (/^[0-9a-fA-F]{64}$/.test(v)) {
+        bytes = new Uint8Array(32);
+        for (var i = 0; i < 32; i++)
+          bytes[i] = parseInt(v.substr(i * 2, 2), 16);
+      } else { bytes = unb64(v); }
+    } catch (e) {}
+    if (!bytes || bytes.length !== 32) { msg("That is not a 32-byte key."); return; }
+    unlocked(bytes, true);
+  };
+  adv.appendChild(ki); adv.appendChild(kb);
+  u.appendChild(adv);
+  if (!pin && !prf && !wrapRemote)
+    msg("First visit: unlock once with the content key (Advanced), then set a PIN or fingerprint.", true);
+}
+
+function passUnlock(pass) {
+  if (!pass) { msg("Enter the passphrase."); return; }
+  msg("Deriving key…", true);
+  kdfKey(pass, unb64(wrapRemote.salt), wrapRemote.iter || 600000)
+    .then(function (kek) { return gcmDecrypt(kek, wrapRemote); })
+    .then(function (kBuf) { unlocked(new Uint8Array(kBuf), true); })
+    .catch(function () { msg("Wrong passphrase."); });
+}
+function pinUnlock(wrap, pinVal) {
+  if (!pinVal) { msg("Enter the PIN."); return; }
+  kdfKey(pinVal, unb64(wrap.salt), wrap.iter || 300000)
+    .then(function (kek) { return gcmDecrypt(kek, wrap); })
+    .then(function (kBuf) { unlocked(new Uint8Array(kBuf), false); })
+    .catch(function () { msg("Wrong PIN."); });
+}
+function prfUnlock(wrap) {
+  msg("Touch the sensor…", true);
+  navigator.credentials.get({ publicKey: {
+    challenge: rand(32), rpId: location.hostname,
+    allowCredentials: [{ type: "public-key", id: unb64(wrap.credId) }],
+    userVerification: "required",
+    extensions: { prf: { eval: { first: unb64(wrap.salt) } } }
+  }}).then(function (a) {
+    var res = a.getClientExtensionResults();
+    var secret = res.prf && res.prf.results && res.prf.results.first;
+    if (!secret) throw new Error("no prf");
+    return rawKey(new Uint8Array(secret)).then(function (kek) {
+      return gcmDecrypt(kek, wrap);
+    });
+  }).then(function (kBuf) { unlocked(new Uint8Array(kBuf), false); })
+    .catch(function (e) { msg("Fingerprint unlock failed — use PIN or passphrase."); });
+}
+
+function unlocked(kBytes, firstStyle) {
+  tryKey(kBytes).then(function (plainBuf) {
+    K = kBytes;
+    var pin = lsGet(LS.pin), prf = lsGet(LS.prf);
+    var wantSetup = location.hash === "#setup" || (!pin && !prf);
+    if (wantSetup) renderSetup(plainBuf);
+    else launch(plainBuf);
+  }).catch(function () { msg("That key does not open this build."); });
+}
+
+// ---------- setup ----------
+function renderSetup(plainBuf) {
+  var u = $("unlock"); u.innerHTML = "";
+  msg("Unlocked. Set up this device:", true);
+
+  var pi = document.createElement("input");
+  pi.type = "password"; pi.inputMode = "numeric";
+  pi.placeholder = "New PIN (6+ digits)"; pi.autocomplete = "off";
+  var pb = document.createElement("button");
+  pb.textContent = "Set PIN on this device";
+  pb.onclick = function () {
+    if (!/^\d{6,}$/.test(pi.value)) { msg("PIN: at least 6 digits."); return; }
+    var salt = rand(16);
+    kdfKey(pi.value, salt, 300000).then(function (kek) {
+      return gcmEncrypt(kek, K);
+    }).then(function (w) {
+      w.salt = b64(salt); w.iter = 300000; lsSet(LS.pin, w);
+      msg("PIN set on this device.", true); pi.value = "";
+    });
+  };
+  u.appendChild(pi); u.appendChild(pb);
+
+  if (window.PublicKeyCredential) {
+    var fb = document.createElement("button");
+    fb.textContent = "Enable fingerprint on this device";
+    fb.onclick = function () { enrollPrf(); };
+    u.appendChild(fb);
+  }
+
+  var hr = document.createElement("hr"); u.appendChild(hr);
+  var ti = document.createElement("input");
+  ti.type = "password"; ti.placeholder = "GitHub token (results auto-backup)";
+  ti.autocomplete = "off";
+  var tb = document.createElement("button");
+  tb.textContent = "Save backup token";
+  tb.onclick = function () {
+    if (!ti.value.trim()) { msg("Paste the fine-grained token first."); return; }
+    rawKey(K).then(function (key) {
+      return gcmEncrypt(key, te(ti.value.trim()));
+    }).then(function (w) { lsSet(LS.tok, w);
+      msg("Backup token saved (encrypted).", true); ti.value = ""; });
+  };
+  u.appendChild(ti); u.appendChild(tb);
+
+  var go = document.createElement("button");
+  go.className = "primary"; go.textContent = "Open the app";
+  go.onclick = function () { launch(plainBuf); };
+  u.appendChild(go);
+}
+
+function enrollPrf() {
+  msg("Creating passkey…", true);
+  navigator.credentials.create({ publicKey: {
+    rp: { name: "RIP", id: location.hostname },
+    user: { id: rand(16), name: "matt", displayName: "Matt" },
+    challenge: rand(32),
+    pubKeyCredParams: [{ type: "public-key", alg: -7 },
+                       { type: "public-key", alg: -257 }],
+    authenticatorSelection: { authenticatorAttachment: "platform",
+      residentKey: "preferred", userVerification: "required" },
+    extensions: { prf: {} }
+  }}).then(function (cred) {
+    var ext = cred.getClientExtensionResults();
+    if (!(ext.prf && ext.prf.enabled))
+      throw new Error("This device's passkey cannot derive keys (no PRF).");
+    var salt = rand(32);
+    return navigator.credentials.get({ publicKey: {
+      challenge: rand(32), rpId: location.hostname,
+      allowCredentials: [{ type: "public-key", id: cred.rawId }],
+      userVerification: "required",
+      extensions: { prf: { eval: { first: salt } } }
+    }}).then(function (a) {
+      var res = a.getClientExtensionResults();
+      var secret = res.prf && res.prf.results && res.prf.results.first;
+      if (!secret) throw new Error("PRF returned nothing at assertion time.");
+      return rawKey(new Uint8Array(secret)).then(function (kek) {
+        return gcmEncrypt(kek, K);
+      }).then(function (w) {
+        w.credId = b64(cred.rawId); w.salt = b64(salt);
+        lsSet(LS.prf, w);
+        msg("Fingerprint enabled on this device.", true);
+      });
+    });
+  }).catch(function (e) { msg("Fingerprint setup failed: " + e.message); });
+}
+
+// ---------- results auto-backup shim + launch ----------
+function getToken() {
+  var w = lsGet(LS.tok);
+  if (!w || !K) return Promise.resolve(null);
+  return rawKey(K).then(function (key) { return gcmDecrypt(key, w); })
+    .then(function (buf) { return new TextDecoder().decode(buf); })
+    .catch(function () { return null; });
+}
+
+function installShim() {
+  if (window.claude) return;
+  var art = {
+    publish: function (html) {
+      var m = html.match(
+        /<script type="application\/json" id="rip-data">([\s\S]*?)<\/script>/);
+      if (!m) return Promise.reject({ code: "no-island" });
+      var data;
+      try { data = JSON.parse(m[1]); }
+      catch (e) { return Promise.reject({ code: "bad-island" }); }
+      var slim = { generated: data.generated, queue: data.queue,
+                   results: data.results || [],
+                   saved_at: new Date().toISOString() };
+      return getToken().then(function (tok) {
+        if (!tok) return Promise.reject({ code: "no-token" });
+        var api = "https://api.github.com/repos/" + OWNER + "/" +
+                  RESULTS_REPO + "/contents/" + STATE_PATH;
+        var headers = { "Authorization": "Bearer " + tok,
+                        "Accept": "application/vnd.github+json" };
+        return fetch(api, { headers: headers }).then(function (r) {
+          return r.ok ? r.json().then(function (j) { return j.sha; })
+                      : null;
+        }).catch(function () { return null; }).then(function (sha) {
+          var body = { message: "drill results " + slim.saved_at,
+                       content: b64(te(JSON.stringify(slim, null, 1))) };
+          if (sha) body.sha = sha;
+          return fetch(api, { method: "PUT", headers: headers,
+                              body: JSON.stringify(body) });
+        }).then(function (put) {
+          if (!put.ok) return Promise.reject({ code: "push-" + put.status });
+        });
+      });
+    }
+  };
+  window.claude = {
+    use: function (cap) {
+      return Promise.resolve(cap === "artifact" ? art : null);
+    }
+  };
+}
+
+function launch(plainBuf) {
+  msg("Opening…", true);
+  new Response(
+    new Blob([plainBuf]).stream().pipeThrough(new DecompressionStream("gzip"))
+  ).text().then(function (html) {
+    installShim();
+    document.open();
+    document.write(html);
+    document.close();
+  }).catch(function (e) { msg("Decompress failed: " + e.message); });
+}
+</script>
+</body>
+</html>
