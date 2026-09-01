@@ -42,6 +42,9 @@
   .ok { color:#7fbf9a; }
   details { margin-top:.8rem; font-size:.85rem; color:#9fb0a5; }
   details input { font-family: monospace; font-size:.85rem; }
+  .showtog { display: block; margin-top: 0.8rem; font-size: 0.85rem;
+             color: #9fb0a5; cursor: pointer; user-select: none; }
+  .showtog input { width: auto; margin-right: 0.4rem; }
   .row { display:flex; gap:.5rem; }
   .row > * { flex:1; }
   hr { border:0; border-top:1px solid #2a382f; margin:1rem 0; }
@@ -89,6 +92,23 @@ function lsGet(k) { try { var v = localStorage.getItem(k);
   return v ? JSON.parse(v) : null; } catch (e) { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); }
   catch (e) {} }
+function addShowToggle(parent) {
+  var lbl = document.createElement("label");
+  lbl.className = "showtog";
+  lbl.innerHTML = "<input type=\"checkbox\"> show my typing";
+  lbl.querySelector("input").addEventListener("change", function () {
+    var on = this.checked;
+    parent.querySelectorAll("input").forEach(function (inp) {
+      if (inp.type === "checkbox") return;
+      if (on && inp.type === "password") {
+        inp.dataset.was = "1"; inp.type = "text";
+      } else if (!on && inp.dataset.was) {
+        delete inp.dataset.was; inp.type = "password";
+      }
+    });
+  });
+  parent.appendChild(lbl);
+}
 
 // ---------- crypto ----------
 function kdfKey(secret, saltU8, iter) {
@@ -206,6 +226,7 @@ function renderUnlock() {
   u.appendChild(adv);
   if (!pin && !prf && !wrapRemote)
     msg("First visit: unlock once with the content key (Advanced), then set a PIN or fingerprint.", true);
+  addShowToggle(u);
 }
 
 function passUnlock(pass) {
@@ -299,6 +320,7 @@ function renderSetup(plainBuf) {
   go.className = "primary"; go.textContent = "Open the app";
   go.onclick = function () { launch(plainBuf); };
   u.appendChild(go);
+  addShowToggle(u);
 }
 
 function enrollPrf() {
