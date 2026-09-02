@@ -436,7 +436,10 @@ function launch(plainBuf) {
   ).text().then(function (html) {
     installShim();
     document.open();
-    document.write(html);
+    // The app page starts at <meta charset>; without a doctype the
+    // rewritten document lands in quirks mode. Prepend it always.
+    document.write(/^\s*<!doctype/i.test(html) ? html
+                   : "<!doctype html>\n" + html);
     document.close();
   }).catch(function (e) { msg("Decompress failed: " + e.message); });
 }
