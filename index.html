@@ -65,7 +65,7 @@ var OWNER = "postmaster87";
 var RESULTS_REPO = "rip-results";
 var STATE_PATH = "state/results-state.json";
 var LS = { pin: "ripapp:wrap-pin", prf: "ripapp:wrap-prf",
-           tok: "ripapp:wrap-tok" };
+           tok: "ripapp:wrap-tok", key: "ripapp:key" };
 var MAGIC = "RIPAPP1";
 
 var encBuf = null, wrapRemote = null, K = null;
@@ -158,8 +158,33 @@ Promise.all([
   var head = String.fromCharCode.apply(null, encBuf.subarray(0, MAGIC.length));
   if (head !== MAGIC) { msg("app.enc is not a RIP blob"); return; }
   wrapRemote = got[1];
-  renderUnlock();
+  // Matt's ruling 2026-09-02 ("this is not a crypto wallet"): remembered
+  // devices open with NOTHING — or just the fingerprint when enrolled.
+  var remembered = lsGet(LS.key);
+  var prf = lsGet(LS.prf);
+  if (remembered && prf && window.PublicKeyCredential) {
+    renderBioGate(prf);
+  } else if (remembered) {
+    tryKey(unb64(remembered)).then(function (plainBuf) {
+      K = unb64(remembered);
+      launch(plainBuf);
+    }).catch(function () { renderUnlock(); });
+  } else {
+    renderUnlock();
+  }
 }).catch(function (e) { msg("Load failed: " + e.message); });
+
+function renderBioGate(prf) {
+  var u = $("unlock"); u.innerHTML = "";
+  var fb = document.createElement("button");
+  fb.className = "primary"; fb.textContent = "Unlock with fingerprint";
+  fb.onclick = function () { prfUnlock(prf); };
+  u.appendChild(fb);
+  var alt = document.createElement("button");
+  alt.textContent = "Use password instead";
+  alt.onclick = renderUnlock;
+  u.appendChild(alt);
+}
 
 function tryKey(kBytes) {
   return rawKey(kBytes).then(function (key) {
@@ -170,9 +195,10 @@ function tryKey(kBytes) {
 }
 
 // ---------- unlock UI ----------
+var rememberMe = true;
 function renderUnlock() {
   var u = $("unlock"); u.innerHTML = "";
-  var pin = lsGet(LS.pin), prf = lsGet(LS.prf);
+  var prf = lsGet(LS.prf);
 
   if (prf && window.PublicKeyCredential) {
     var fb = document.createElement("button");
@@ -180,38 +206,24 @@ function renderUnlock() {
     fb.onclick = function () { prfUnlock(prf); };
     u.appendChild(fb);
   }
-  if (pin) {
-    var pi = document.createElement("input");
-    pi.type = "password"; pi.inputMode = "numeric";
-    pi.placeholder = "PIN"; pi.autocomplete = "off";
-    var pb = document.createElement("button");
-    pb.textContent = "Unlock with PIN";
-    pb.onclick = function () { pinUnlock(pin, pi.value); };
-    pi.addEventListener("keydown", function (e) {
-      if (e.key === "Enter") pb.click(); });
-    u.appendChild(pi); u.appendChild(pb);
-  }
-  if (wrapRemote && !pin && !prf) {
-    var si = document.createElement("input");
-    si.type = "password"; si.placeholder = "Passphrase";
-    si.autocomplete = "off";
+  if (wrapRemote) {
+    var si = noAuto(document.createElement("input"));
+    si.type = "password"; si.placeholder = "Password";
     var sb = document.createElement("button");
-    sb.className = (prf || pin) ? "" : "primary";
-    sb.textContent = "Unlock with passphrase";
+    if (!prf) sb.className = "primary";
+    sb.textContent = "Unlock";
     sb.onclick = function () { passUnlock(si.value); };
     si.addEventListener("keydown", function (e) {
       if (e.key === "Enter") sb.click(); });
     u.appendChild(si); u.appendChild(sb);
-  } else if (wrapRemote) {
-    var d1 = document.createElement("details");
-    d1.innerHTML = "<summary>Use passphrase instead</summary>";
-    var si2 = document.createElement("input");
-    si2.type = "password"; si2.placeholder = "Passphrase";
-    var sb2 = document.createElement("button");
-    sb2.textContent = "Unlock";
-    sb2.onclick = function () { passUnlock(si2.value); };
-    d1.appendChild(si2); d1.appendChild(sb2);
-    u.appendChild(d1);
+    var rl = document.createElement("label");
+    rl.className = "showtog";
+    rl.innerHTML = "<input type=\"checkbox\" checked> remember this "
+      + "device (open with nothing next time)";
+    rl.querySelector("input").addEventListener("change", function () {
+      rememberMe = this.checked;
+    });
+    u.appendChild(rl);
   }
   var adv = document.createElement("details");
   adv.innerHTML = "<summary>Advanced: content key</summary>";
@@ -288,8 +300,10 @@ function prfUnlock(wrap) {
 function unlocked(kBytes, firstStyle) {
   tryKey(kBytes).then(function (plainBuf) {
     K = kBytes;
-    var pin = lsGet(LS.pin), prf = lsGet(LS.prf);
-    var wantSetup = location.hash === "#setup" || (!pin && !prf);
+    if (rememberMe) lsSet(LS.key, b64(K));
+    var prf = lsGet(LS.prf);
+    var wantSetup = location.hash === "#setup"
+      || (!prf && !!window.PublicKeyCredential);
     if (wantSetup) renderSetup(plainBuf);
     else launch(plainBuf);
   }).catch(function () { msg("That key does not open this build."); });
@@ -298,24 +312,7 @@ function unlocked(kBytes, firstStyle) {
 // ---------- setup ----------
 function renderSetup(plainBuf) {
   var u = $("unlock"); u.innerHTML = "";
-  msg("Unlocked. Set up this device:", true);
-
-  var pi = document.createElement("input");
-  pi.type = "password"; pi.inputMode = "numeric";
-  pi.placeholder = "New PIN (6+ digits)"; pi.autocomplete = "off";
-  var pb = document.createElement("button");
-  pb.textContent = "Set PIN on this device";
-  pb.onclick = function () {
-    if (!/^\d{6,}$/.test(pi.value)) { msg("PIN: at least 6 digits."); return; }
-    var salt = rand(16);
-    kdfKey(pi.value, salt, 300000).then(function (kek) {
-      return gcmEncrypt(kek, K);
-    }).then(function (w) {
-      w.salt = b64(salt); w.iter = 300000; lsSet(LS.pin, w);
-      msg("PIN set on this device.", true); pi.value = "";
-    });
-  };
-  u.appendChild(pi); u.appendChild(pb);
+  msg("Unlocked. One optional step:", true);
 
   if (window.PublicKeyCredential) {
     var fb = document.createElement("button");
