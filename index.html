@@ -400,6 +400,7 @@ function installShim() {
       catch (e) { return Promise.reject({ code: "bad-island" }); }
       var slim = { generated: data.generated, queue: data.queue,
                    results: data.results || [],
+                   info_marks: data.info_marks || [],
                    saved_at: new Date().toISOString() };
       return getToken().then(function (tok) {
         if (!tok) return Promise.reject({ code: "no-token" });
