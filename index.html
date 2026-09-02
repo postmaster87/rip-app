@@ -92,7 +92,17 @@ function lsGet(k) { try { var v = localStorage.getItem(k);
   return v ? JSON.parse(v) : null; } catch (e) { return null; } }
 function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); }
   catch (e) {} }
+function noAuto(inp) {
+  inp.setAttribute("autocapitalize", "none");
+  inp.setAttribute("autocorrect", "off");
+  inp.setAttribute("spellcheck", "false");
+  inp.setAttribute("autocomplete", "off");
+  return inp;
+}
 function addShowToggle(parent) {
+  parent.querySelectorAll("input").forEach(function (i) {
+    if (i.type !== "checkbox") noAuto(i);
+  });
   var lbl = document.createElement("label");
   lbl.className = "showtog";
   lbl.innerHTML = "<input type=\"checkbox\"> show my typing";
@@ -230,12 +240,25 @@ function renderUnlock() {
 }
 
 function passUnlock(pass) {
-  if (!pass) { msg("Enter the passphrase."); return; }
+  if (!pass || !pass.trim()) { msg("Enter the passphrase."); return; }
+  // Forgive what phone keyboards do: stray ends, doubled spaces,
+  // an auto-capitalized first letter.
+  var cands = [], seen = {};
+  [pass, pass.trim(), pass.trim().replace(/\s+/g, " "),
+   pass.trim().replace(/\s+/g, " ").toLowerCase()].forEach(function (c) {
+    if (!seen[c]) { seen[c] = 1; cands.push(c); }
+  });
   msg("Deriving key…", true);
-  kdfKey(pass, unb64(wrapRemote.salt), wrapRemote.iter || 600000)
-    .then(function (kek) { return gcmDecrypt(kek, wrapRemote); })
-    .then(function (kBuf) { unlocked(new Uint8Array(kBuf), true); })
-    .catch(function () { msg("Wrong passphrase."); });
+  var i = 0;
+  function attempt() {
+    if (i >= cands.length) { msg("Wrong passphrase."); return; }
+    var c = cands[i++];
+    kdfKey(c, unb64(wrapRemote.salt), wrapRemote.iter || 600000)
+      .then(function (kek) { return gcmDecrypt(kek, wrapRemote); })
+      .then(function (kBuf) { unlocked(new Uint8Array(kBuf), true); })
+      .catch(attempt);
+  }
+  attempt();
 }
 function pinUnlock(wrap, pinVal) {
   if (!pinVal) { msg("Enter the PIN."); return; }
