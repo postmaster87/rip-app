@@ -533,9 +533,36 @@ function installShim() {
       });
     }
   };
+  // Due-line notifications: the page hands its push subscription here;
+  // it lands in the PRIVATE results repo for the Actions sender.
+  var pushstore = {
+    save: function (sub) {
+      return getToken().then(function (tok) {
+        if (!tok) return Promise.reject({ code: "no-token" });
+        var api = "https://api.github.com/repos/" + OWNER + "/" +
+                  RESULTS_REPO + "/contents/state/push-subscription.json";
+        var headers = { "Authorization": "Bearer " + tok,
+                        "Accept": "application/vnd.github+json" };
+        return fetch(api, { headers: headers }).then(function (r) {
+          return r.ok ? r.json().then(function (j) { return j.sha; })
+                      : null;
+        }).catch(function () { return null; }).then(function (sha) {
+          var body = { message: "push subscription " +
+                         new Date().toISOString(),
+                       content: b64(te(JSON.stringify(sub, null, 1))) };
+          if (sha) body.sha = sha;
+          return fetch(api, { method: "PUT", headers: headers,
+                              body: JSON.stringify(body) });
+        }).then(function (put) {
+          if (!put.ok) return Promise.reject({ code: "push-" + put.status });
+        });
+      });
+    }
+  };
   window.claude = {
     use: function (cap) {
-      return Promise.resolve(cap === "artifact" ? art : null);
+      return Promise.resolve(cap === "artifact" ? art
+        : cap === "pushstore" ? pushstore : null);
     }
   };
 }
