@@ -64,8 +64,8 @@
 var OWNER = "postmaster87";
 var RESULTS_REPO = "rip-results";
 var STATE_PATH = "state/results-state.json";
-var LS = { pin: "ripapp:wrap-pin", prf: "ripapp:wrap-prf",
-           tok: "ripapp:wrap-tok", key: "ripapp:key" };
+var LS = { prf: "ripapp:wrap-prf", tok: "ripapp:wrap-tok",
+           key: "ripapp:key" };
 var MAGIC = "RIPAPP1";
 
 var encBuf = null, wrapRemote = null, K = null;
@@ -246,8 +246,12 @@ function renderUnlock() {
   };
   adv.appendChild(ki); adv.appendChild(kb);
   u.appendChild(adv);
-  if (!pin && !prf && !wrapRemote)
-    msg("First visit: unlock once with the content key (Advanced), then set a PIN or fingerprint.", true);
+  // No `pin` here — the PIN UI left on 09-02 and a dangling reference
+  // threw "Load failed: pin is not defined" on every fresh device.
+  if (!prf && !wrapRemote)
+    msg("New device: open Advanced and unlock once with the content key " +
+        "(password manager). It is remembered after that; fingerprint " +
+        "is offered on the next screen.", true);
   addShowToggle(u);
 }
 
@@ -271,13 +275,6 @@ function passUnlock(pass) {
       .catch(attempt);
   }
   attempt();
-}
-function pinUnlock(wrap, pinVal) {
-  if (!pinVal) { msg("Enter the PIN."); return; }
-  kdfKey(pinVal, unb64(wrap.salt), wrap.iter || 300000)
-    .then(function (kek) { return gcmDecrypt(kek, wrap); })
-    .then(function (kBuf) { unlocked(new Uint8Array(kBuf), false); })
-    .catch(function () { msg("Wrong PIN."); });
 }
 function prfUnlock(wrap) {
   msg("Touch the sensor…", true);
