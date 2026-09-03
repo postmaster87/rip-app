@@ -332,9 +332,16 @@ function renderSetup(plainBuf) {
     rawKey(K).then(function (key) {
       return gcmEncrypt(key, te(ti.value.trim()));
     }).then(function (w) { lsSet(LS.tok, w);
-      msg("Backup token saved (encrypted).", true); ti.value = ""; });
+      ti.value = "";
+      msg("Token saved — testing the pipe…", true);
+      testBackup();
+    });
   };
   u.appendChild(ti); u.appendChild(tb);
+  var tt = document.createElement("button");
+  tt.textContent = "Test backup connection";
+  tt.onclick = testBackup;
+  u.appendChild(tt);
 
   var go = document.createElement("button");
   go.className = "primary"; go.textContent = "Open the app";
@@ -380,6 +387,37 @@ function enrollPrf() {
 }
 
 // ---------- results auto-backup shim + launch ----------
+function testBackup() {
+  // Preflight: prove the token can actually reach the results repo,
+  // BEFORE a training session bets its results on it. Private repos
+  // answer 404 (not 401) to a token without access — say so plainly.
+  getToken().then(function (tok) {
+    if (!tok) { msg("No backup token saved on this device."); return; }
+    var api = "https://api.github.com/repos/" + OWNER + "/" +
+              RESULTS_REPO + "/contents/" + STATE_PATH;
+    fetch(api, { headers: { "Authorization": "Bearer " + tok,
+                            "Accept": "application/vnd.github+json" } })
+      .then(function (r) {
+        if (r.ok) {
+          msg("Backup pipe verified — results will save " +
+              "automatically. ✓", true);
+        } else if (r.status === 404) {
+          msg("GitHub cannot see rip-results with this token. Recreate " +
+              "it: Settings → Developer settings → Fine-grained " +
+              "tokens → Only select repositories → rip-results " +
+              "→ Contents: Read and write. Then save it here again.");
+        } else if (r.status === 401) {
+          msg("Token invalid or expired — generate a new one and " +
+              "save it here.");
+        } else {
+          msg("GitHub answered HTTP " + r.status + " — check the " +
+              "connection and try again.");
+        }
+      })
+      .catch(function () { msg("No connection to GitHub right now."); });
+  });
+}
+
 function getToken() {
   var w = lsGet(LS.tok);
   if (!w || !K) return Promise.resolve(null);
