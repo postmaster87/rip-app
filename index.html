@@ -384,34 +384,108 @@ function enrollPrf() {
 }
 
 // ---------- results auto-backup shim + launch ----------
+// Dev feedback channel (Matt, 09-03): every preflight outcome is written
+// into a diagnostics block he can copy and paste into chat. Never the
+// token itself — only whether one exists and what family it is.
+var DIAG = null;
+function tokenFamily(tok) {
+  if (!tok) return "none";
+  if (tok.indexOf("github_pat_") === 0) return "fine-grained";
+  if (tok.indexOf("ghp_") === 0) return "classic";
+  return "unknown-prefix";
+}
+function showDiag(lines) {
+  DIAG = lines.join("\n");
+  var old = $("diag"); if (old) old.remove();
+  var box = document.createElement("div"); box.id = "diag";
+  var pre = document.createElement("pre");
+  pre.style.cssText = "white-space:pre-wrap;font-size:.75rem;color:#9fb0a5;" +
+    "background:#111a15;border:1px solid #2a382f;border-radius:10px;" +
+    "padding:.6rem;margin:.5rem 0;user-select:text;-webkit-user-select:text;";
+  pre.textContent = DIAG;
+  var cb = document.createElement("button");
+  cb.textContent = "Copy diagnostics";
+  cb.onclick = function () {
+    var done = function () { cb.textContent = "Copied — paste it to Claude"; };
+    if (navigator.clipboard && navigator.clipboard.writeText)
+      navigator.clipboard.writeText(DIAG).then(done, function () {
+        cb.textContent = "Copy blocked — long-press the text above";
+      });
+    else cb.textContent = "Copy blocked — long-press the text above";
+  };
+  box.appendChild(pre); box.appendChild(cb);
+  $("card").appendChild(box);
+}
+
 function testBackup() {
   // Preflight: prove the token can actually reach the results repo,
   // BEFORE a training session bets its results on it. Private repos
   // answer 404 (not 401) to a token without access — say so plainly.
+  var d = ["RIP backup preflight " + new Date().toISOString(),
+           "loader: " + (document.title || "RIP") + " @ " + location.href,
+           "online: " + navigator.onLine + "  ua: " +
+             navigator.userAgent.slice(0, 90)];
+  var api = "https://api.github.com/repos/" + OWNER + "/" +
+            RESULTS_REPO + "/contents/" + STATE_PATH;
+  d.push("target: " + api);
   getToken().then(function (tok) {
-    if (!tok) { msg("No backup token saved on this device."); return; }
-    var api = "https://api.github.com/repos/" + OWNER + "/" +
-              RESULTS_REPO + "/contents/" + STATE_PATH;
-    fetch(api, { headers: { "Authorization": "Bearer " + tok,
-                            "Accept": "application/vnd.github+json" } })
-      .then(function (r) {
+    var w = lsGet(LS.tok);
+    d.push("token wrap stored: " + !!w + "  decrypted: " + !!tok +
+           "  family: " + tokenFamily(tok) +
+           "  length: " + (tok ? tok.length : 0));
+    if (!tok) {
+      msg("No backup token saved on this device.");
+      d.push("result: no token"); showDiag(d); return;
+    }
+    var req;
+    try {
+      req = fetch(api, { headers: { "Authorization": "Bearer " + tok,
+                                    "Accept": "application/vnd.github+json" } });
+    } catch (e) {
+      msg("The token has a character GitHub headers cannot carry — " +
+          "re-paste it.");
+      d.push("result: fetch threw synchronously: " + e.name + ": " + e.message);
+      showDiag(d); return;
+    }
+    var t0 = Date.now();
+    req.then(function (r) {
+        d.push("http: " + r.status + " " + (r.statusText || "") +
+               "  in " + (Date.now() - t0) + " ms" +
+               "  ratelimit-remaining: " +
+               (r.headers.get("x-ratelimit-remaining") || "?"));
         if (r.ok) {
           msg("Backup pipe verified — results will save " +
               "automatically. ✓", true);
+          d.push("result: OK — token reaches rip-results");
         } else if (r.status === 404) {
           msg("GitHub cannot see rip-results with this token. Recreate " +
               "it: Settings → Developer settings → Fine-grained " +
               "tokens → Only select repositories → rip-results " +
               "→ Contents: Read and write. Then save it here again.");
+          d.push("result: 404 — token not granted to rip-results " +
+                 "(or repo name/owner differs)");
         } else if (r.status === 401) {
           msg("Token invalid or expired — generate a new one and " +
               "save it here.");
+          d.push("result: 401 — token rejected");
         } else {
           msg("GitHub answered HTTP " + r.status + " — check the " +
               "connection and try again.");
+          d.push("result: unexpected HTTP " + r.status);
         }
+        return r.text().then(function (body) {
+          d.push("body: " + body.slice(0, 160).replace(/\s+/g, " "));
+        }).catch(function () {});
       })
-      .catch(function () { msg("No connection to GitHub right now."); });
+      .catch(function (e) {
+        msg("No connection to GitHub right now (" + e.name + ": " +
+            e.message + ").");
+        d.push("result: fetch rejected after " + (Date.now() - t0) +
+               " ms: " + e.name + ": " + e.message);
+        d.push("hint: a rejected fetch is network/DNS/blocker/CORS, " +
+               "not the token — the token was never evaluated");
+      })
+      .then(function () { showDiag(d); });
   });
 }
 
