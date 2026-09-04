@@ -4,6 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
+<meta name="theme-color" content="#111a15">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="RIP">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
 <title>RIP</title>
 <!--
   RIP app mirror — encrypted loader.
@@ -18,7 +26,16 @@
   standing in for the artifact-save capability pushes the results island
   to a PRIVATE GitHub repo using a fine-grained token stored here only
   encrypted under the content key.
+
+  2026-09-04 (handoff item 4, staged cutover): when Matt's brain login is
+  present on the device the ciphertext is fetched from Firebase Storage
+  behind that login (the bucket's rules admit his UID only); GitHub
+  Pages' copy is the fallback until PAGES_BLOB is flipped off by
+  publish_app.py, after which a fresh device signs in here first.
+  Installable as a PWA (manifest + icons + service worker) — item 6.
 -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
 <style>
   :root { color-scheme: dark; }
   body { margin:0; background:#111a15; color:#e4ebe5;
@@ -40,6 +57,7 @@
           font-size:1rem; }
   .msg { min-height:1.3rem; font-size:.85rem; color:#d99181; }
   .ok { color:#7fbf9a; }
+  .warn { font-size:.85rem; color:#e0b76a; margin:.2rem 0 .4rem; }
   details { margin-top:.8rem; font-size:.85rem; color:#9fb0a5; }
   details input { font-family: monospace; font-size:.85rem; }
   .showtog { display: block; margin-top: 0.8rem; font-size: 0.85rem;
@@ -68,7 +86,23 @@ var LS = { prf: "ripapp:wrap-prf", tok: "ripapp:wrap-tok",
            key: "ripapp:key" };
 var MAGIC = "RIPAPP1";
 
+// The brain's public config (not a secret; the rules admit one UID).
+var FB_CONFIG = {
+  apiKey: "AIzaSyBwliXJTbN5gEnN2an1_6TsddHFdnYUD34",
+  authDomain: "rip-brain-app.firebaseapp.com",
+  projectId: "rip-brain-app",
+  storageBucket: "rip-brain-app.firebasestorage.app",
+  messagingSenderId: "868882142481",
+  appId: "1:868882142481:web:07dea713ef623c5d5968b0"
+};
+var STORAGE_URL = "https://firebasestorage.googleapis.com/v0/b/" +
+  FB_CONFIG.storageBucket + "/o/app.enc?alt=media";
+// Stamped by publish_app.py: true while GitHub Pages still carries
+// app.enc (the fallback), false after the Storage cutover.
+var PAGES_BLOB = true;
+
 var encBuf = null, wrapRemote = null, K = null;
+var BLOB_SOURCE = "";   // "storage" | "pages" — for the diagnostics only
 
 // ---------- small utils ----------
 function $(id) { return document.getElementById(id); }
@@ -144,35 +178,130 @@ function gcmDecrypt(key, wrap) {
     key, unb64(wrap.c));
 }
 
-// ---------- boot ----------
-Promise.all([
-  fetch("app.enc", { cache: "no-cache" }).then(function (r) {
-    if (!r.ok) throw new Error("app.enc " + r.status);
+// ---------- the brain's login, for the blob ----------
+function fbInit() {
+  if (typeof firebase === "undefined") return null;
+  try {
+    return firebase.apps.length ? firebase.app()
+                                : firebase.initializeApp(FB_CONFIG);
+  } catch (e) { return null; }
+}
+// Resolves the persisted user (the app page signed in on this device
+// before) or null; never hangs the unlock on a slow auth handshake.
+function authUser(timeoutMs) {
+  return new Promise(function (res) {
+    if (!fbInit()) return res(null);
+    var done = false;
+    var t = setTimeout(function () {
+      if (!done) { done = true; res(null); }
+    }, timeoutMs);
+    try {
+      var off = firebase.auth().onAuthStateChanged(function (u) {
+        if (done) return;
+        done = true; clearTimeout(t); off(); res(u || null);
+      });
+    } catch (e) {
+      if (!done) { done = true; clearTimeout(t); res(null); }
+    }
+  });
+}
+function fetchBlobStorage(user) {
+  return user.getIdToken().then(function (tok) {
+    return fetch(STORAGE_URL, { cache: "no-store",
+      headers: { "Authorization": "Firebase " + tok } });
+  }).then(function (r) {
+    if (!r.ok) throw new Error("storage " + r.status);
+    BLOB_SOURCE = "storage";
     return r.arrayBuffer();
-  }),
-  fetch("wrap.json", { cache: "no-cache" })
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .catch(function () { return null; })
-]).then(function (got) {
-  encBuf = new Uint8Array(got[0]);
-  var head = String.fromCharCode.apply(null, encBuf.subarray(0, MAGIC.length));
-  if (head !== MAGIC) { msg("app.enc is not a RIP blob"); return; }
-  wrapRemote = got[1];
-  // Matt's ruling 2026-09-02 ("this is not a crypto wallet"): remembered
-  // devices open with NOTHING — or just the fingerprint when enrolled.
-  var remembered = lsGet(LS.key);
-  var prf = lsGet(LS.prf);
-  if (remembered && prf && window.PublicKeyCredential) {
-    renderBioGate(prf);
-  } else if (remembered) {
-    tryKey(unb64(remembered)).then(function (plainBuf) {
-      K = unb64(remembered);
-      launch(plainBuf);
-    }).catch(function () { renderUnlock(); });
-  } else {
-    renderUnlock();
-  }
-}).catch(function (e) { msg("Load failed: " + e.message); });
+  });
+}
+function fetchBlobPages() {
+  return fetch("app.enc", { cache: "no-cache" }).then(function (r) {
+    if (!r.ok) throw new Error("app.enc " + r.status);
+    BLOB_SOURCE = "pages";
+    return r.arrayBuffer();
+  });
+}
+function fetchBlob() {
+  return authUser(2500).then(function (u) {
+    if (u) {
+      return fetchBlobStorage(u).catch(function (e) {
+        if (!PAGES_BLOB) throw e;
+        return fetchBlobPages();
+      });
+    }
+    if (!PAGES_BLOB) throw new Error("signin");
+    return fetchBlobPages();
+  });
+}
+
+// ---------- boot ----------
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js").catch(function () {});
+}
+function boot() {
+  Promise.all([
+    fetchBlob(),
+    fetch("wrap.json", { cache: "no-cache" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; })
+  ]).then(function (got) {
+    encBuf = new Uint8Array(got[0]);
+    var head = String.fromCharCode.apply(null, encBuf.subarray(0, MAGIC.length));
+    if (head !== MAGIC) { msg("app.enc is not a RIP blob"); return; }
+    wrapRemote = got[1];
+    // Matt's ruling 2026-09-02 ("this is not a crypto wallet"): remembered
+    // devices open with NOTHING — or just the fingerprint when enrolled.
+    var remembered = lsGet(LS.key);
+    var prf = lsGet(LS.prf);
+    if (remembered && prf && window.PublicKeyCredential) {
+      renderBioGate(prf);
+    } else if (remembered) {
+      tryKey(unb64(remembered)).then(function (plainBuf) {
+        K = unb64(remembered);
+        launch(plainBuf);
+      }).catch(function () { renderUnlock(); });
+    } else {
+      renderUnlock();
+    }
+  }).catch(function (e) {
+    if (e && e.message === "signin") { renderSignIn(); return; }
+    if (!PAGES_BLOB) { renderSignIn(e.message); return; }
+    msg("Load failed: " + e.message);
+  });
+}
+boot();
+
+// Post-cutover fresh device: the blob lives behind the brain's login,
+// so sign in here first. The password is the RIP brain account's.
+function renderSignIn(why) {
+  var u = $("unlock"); u.innerHTML = "";
+  msg(why ? "Cloud copy unavailable (" + why + ")." : "", false);
+  var w = document.createElement("p"); w.className = "warn";
+  w.textContent = "Do NOT type your Google password here. This is the " +
+    "RIP brain account password from your password manager.";
+  u.appendChild(w);
+  var em = noAuto(document.createElement("input"));
+  em.type = "email"; em.placeholder = "brain email";
+  em.value = "rusty9645@gmail.com";
+  var pw = document.createElement("input");
+  pw.type = "password"; pw.placeholder = "brain password";
+  pw.autocomplete = "current-password";
+  var sb = document.createElement("button");
+  sb.className = "primary"; sb.textContent = "Sign in to the brain";
+  sb.onclick = function () {
+    if (!fbInit()) { msg("Sign-in unavailable (no Firebase)."); return; }
+    msg("Signing in…", true);
+    firebase.auth().signInWithEmailAndPassword(em.value.trim(), pw.value)
+      .then(function () { pw.value = ""; msg("Signed in — loading…", true);
+                          boot(); })
+      .catch(function (e) { msg("Sign-in failed: " + (e && e.message || e)); });
+  };
+  pw.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") sb.click(); });
+  u.appendChild(em); u.appendChild(pw); u.appendChild(sb);
+  addShowToggle(u);
+}
 
 function renderBioGate(prf) {
   var u = $("unlock"); u.innerHTML = "";
@@ -423,6 +552,8 @@ function testBackup() {
   // answer 404 (not 401) to a token without access — say so plainly.
   var d = ["RIP backup preflight " + new Date().toISOString(),
            "loader: " + (document.title || "RIP") + " @ " + location.href,
+           "blob source: " + (BLOB_SOURCE || "?") + "  pages fallback: " +
+             PAGES_BLOB,
            "online: " + navigator.onLine + "  ua: " +
              navigator.userAgent.slice(0, 90)];
   var api = "https://api.github.com/repos/" + OWNER + "/" +
@@ -533,8 +664,9 @@ function installShim() {
       });
     }
   };
-  // Due-line notifications: the page hands its push subscription here;
-  // it lands in the PRIVATE results repo for the Actions sender.
+  // Legacy due-line channel (pre-brain): the page now stores its push
+  // subscription in the brain itself when signed in; this GitHub path
+  // stays only as the shim's contract and nothing reads it any more.
   var pushstore = {
     save: function (sub) {
       return getToken().then(function (tok) {

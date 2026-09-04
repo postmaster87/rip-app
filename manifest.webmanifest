@@ -1,0 +1,17 @@
+{
+  "name": "RIP",
+  "short_name": "RIP",
+  "description": "Private study.",
+  "id": "/rip-app/",
+  "start_url": "/rip-app/",
+  "scope": "/rip-app/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#111a15",
+  "theme_color": "#111a15",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
