@@ -99,7 +99,7 @@ var STORAGE_URL = "https://firebasestorage.googleapis.com/v0/b/" +
   FB_CONFIG.storageBucket + "/o/app.enc?alt=media";
 // Stamped by publish_app.py: true while GitHub Pages still carries
 // app.enc (the fallback), false after the Storage cutover.
-var PAGES_BLOB = true;
+var PAGES_BLOB = false;
 
 var encBuf = null, wrapRemote = null, K = null;
 var BLOB_SOURCE = "";   // "storage" | "pages" — for the diagnostics only
