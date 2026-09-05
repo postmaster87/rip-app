@@ -81,7 +81,21 @@
 "use strict";
 var OWNER = "postmaster87";
 var RESULTS_REPO = "rip-results";
-var STATE_PATH = "state/results-state.json";
+// Build 68: one results file PER DEVICE (state/results-<device>.json).
+// The single shared file was last-writer-wins: a phone save followed by
+// a laptop save overwrote the phone's session (2026-09-05).
+function deviceId() {
+  var id = null;
+  try { id = localStorage.getItem("ripapp:dev"); } catch (e) {}
+  if (!id) {
+    var u = new Uint8Array(4); crypto.getRandomValues(u);
+    id = Array.prototype.map.call(u, function (b) {
+      return ("0" + b.toString(16)).slice(-2); }).join("");
+    try { localStorage.setItem("ripapp:dev", id); } catch (e) {}
+  }
+  return id;
+}
+var STATE_PATH = "state/results-" + deviceId() + ".json";
 var LS = { prf: "ripapp:wrap-prf", tok: "ripapp:wrap-tok",
            key: "ripapp:key" };
 var MAGIC = "RIPAPP1";
@@ -254,7 +268,15 @@ function boot() {
     // devices open with NOTHING — or just the fingerprint when enrolled.
     var remembered = lsGet(LS.key);
     var prf = lsGet(LS.prf);
-    if (remembered && prf && window.PublicKeyCredential) {
+    // Build 68: "#setup" reaches the device setup screen (backup token,
+    // fingerprint) on a remembered device too - the gear's "Device
+    // setup" button sends the app here.
+    if (remembered && location.hash === "#setup") {
+      tryKey(unb64(remembered)).then(function (plainBuf) {
+        K = unb64(remembered);
+        renderSetup(plainBuf);
+      }).catch(function () { renderUnlock(); });
+    } else if (remembered && prf && window.PublicKeyCredential) {
       renderBioGate(prf);
     } else if (remembered) {
       tryKey(unb64(remembered)).then(function (plainBuf) {
