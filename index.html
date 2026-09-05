@@ -97,7 +97,7 @@ function deviceId() {
 }
 var STATE_PATH = "state/results-" + deviceId() + ".json";
 var LS = { prf: "ripapp:wrap-prf", tok: "ripapp:wrap-tok",
-           key: "ripapp:key" };
+           key: "ripapp:key", brain: "ripapp:wrap-brain" };
 var MAGIC = "RIPAPP1";
 
 // The brain's public config (not a secret; the rules admit one UID).
@@ -243,6 +243,10 @@ function fetchBlob() {
   // still signed in. Wait for a real answer; say so while waiting.
   msg("Checking your sign-in…", true);
   return authUser(12000).then(function (u) {
+    if (u) return u;
+    msg("Signing in to the brain…", true);
+    return brainAutoSignIn();          // the remembered credential, if any
+  }).then(function (u) {
     msg("", true);
     if (u) {
       return fetchBlobStorage(u).catch(function (e) {
@@ -317,24 +321,33 @@ function renderSignIn(why) {
   pw.autocomplete = "current-password";
   var sb = document.createElement("button");
   sb.className = "primary"; sb.textContent = "Sign in to the brain";
+  var rl = document.createElement("label");
+  rl.className = "showtog";
+  rl.innerHTML = "<input type=\"checkbox\" checked> remember the brain "
+    + "sign-in on this device (encrypted under your content key)";
+  var remember = rl.querySelector("input");
   sb.onclick = function () {
     if (!fbInit()) { msg("Sign-in unavailable (no Firebase)."); return; }
     msg("Signing in…", true);
+    var email = em.value.trim(), pass = pw.value;
     // remembered on this device until he signs out (the default, made
     // explicit so a browser quirk cannot downgrade it to session-only)
     var persist = firebase.auth.Auth && firebase.auth.Auth.Persistence
       ? firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
       : Promise.resolve();
     persist.catch(function () {}).then(function () {
-      return firebase.auth().signInWithEmailAndPassword(em.value.trim(), pw.value);
+      return firebase.auth().signInWithEmailAndPassword(email, pass);
     })
-      .then(function () { pw.value = ""; msg("Signed in — loading…", true);
-                          boot(); })
+      .then(function () {
+        pw.value = "";
+        return remember.checked ? brainCredSave(email, pass) : null;
+      })
+      .then(function () { msg("Signed in — loading…", true); boot(); })
       .catch(function (e) { msg("Sign-in failed: " + (e && e.message || e)); });
   };
   pw.addEventListener("keydown", function (e) {
     if (e.key === "Enter") sb.click(); });
-  u.appendChild(em); u.appendChild(pw); u.appendChild(sb);
+  u.appendChild(em); u.appendChild(pw); u.appendChild(sb); u.appendChild(rl);
   addShowToggle(u);
 }
 
@@ -462,6 +475,7 @@ function unlocked(kBytes, firstStyle) {
   tryKey(kBytes).then(function (plainBuf) {
     K = kBytes;
     if (rememberMe) lsSet(LS.key, b64(K));
+    if (pendingBrainCred) brainCredSave(pendingBrainCred.e, pendingBrainCred.p);
     var prf = lsGet(LS.prf);
     var wantSetup = location.hash === "#setup"
       || (!prf && !!window.PublicKeyCredential);
@@ -663,6 +677,46 @@ function getToken() {
     .catch(function () { return null; });
 }
 
+// ---------- the brain sign-in, remembered on this device (Build 71) ----------
+// Matt, 2026-09-05: "can we do something about having to get the brain key
+// everytime" / "fix the fucking log in and get signed into the brain".
+// The app page loads its own Firebase SDK and Firebase's saved session is
+// slow or absent on the phone, so the sign-in kept coming back. Now the
+// brain credential is kept on the device encrypted under the content key
+// (the same wrap as the results token) and used silently whenever Firebase
+// has no session. Forgettable from the gear.
+var pendingBrainCred = null;
+function keyBytes() {
+  if (K) return K;
+  var r = lsGet(LS.key);
+  return r ? unb64(r) : null;
+}
+function brainCredSave(email, pw) {
+  var kb = keyBytes();
+  if (!kb) { pendingBrainCred = { e: email, p: pw }; return Promise.resolve(false); }
+  return rawKey(kb).then(function (key) {
+    return gcmEncrypt(key, te(JSON.stringify({ e: email, p: pw })));
+  }).then(function (w) { lsSet(LS.brain, w); pendingBrainCred = null; return true; })
+    .catch(function () { return false; });
+}
+function brainCredLoad() {
+  var w = lsGet(LS.brain), kb = keyBytes();
+  if (!w || !kb) return Promise.resolve(null);
+  return rawKey(kb).then(function (key) { return gcmDecrypt(key, w); })
+    .then(function (buf) { return JSON.parse(new TextDecoder().decode(buf)); })
+    .catch(function () { return null; });
+}
+function brainAutoSignIn() {
+  if (!fbInit()) return Promise.resolve(null);
+  return brainCredLoad().then(function (c) {
+    if (!c || !c.e || !c.p) return null;
+    return firebase.auth().signInWithEmailAndPassword(c.e, c.p)
+      .then(function (r) { return (r && r.user) || null; })
+      .catch(function () { return null; });
+  });
+}
+function brainForget() { try { localStorage.removeItem(LS.brain); } catch (e) {} }
+
 function installShim() {
   if (window.claude) return;
   var art = {
@@ -731,6 +785,14 @@ function installShim() {
       return Promise.resolve(cap === "artifact" ? art
         : cap === "pushstore" ? pushstore : null);
     }
+  };
+  // Build 71: the app page reaches the remembered brain sign-in through
+  // here (window globals survive the document.write).
+  window.ripBrain = {
+    auto: brainAutoSignIn,
+    remember: brainCredSave,
+    forget: brainForget,
+    has: function () { return !!lsGet(LS.brain); }
   };
 }
 
