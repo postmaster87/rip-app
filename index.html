@@ -237,7 +237,13 @@ function fetchBlobPages() {
   });
 }
 function fetchBlob() {
-  return authUser(2500).then(function (u) {
+  // Build 70 (Matt, 09-05: "having to get the brain key everytime"): a
+  // saved sign-in can take a phone several seconds to surface on a cold
+  // start; 2.5 s made the loader ask for the password while he was
+  // still signed in. Wait for a real answer; say so while waiting.
+  msg("Checking your sign-in…", true);
+  return authUser(12000).then(function (u) {
+    msg("", true);
     if (u) {
       return fetchBlobStorage(u).catch(function (e) {
         if (!PAGES_BLOB) throw e;
@@ -314,7 +320,14 @@ function renderSignIn(why) {
   sb.onclick = function () {
     if (!fbInit()) { msg("Sign-in unavailable (no Firebase)."); return; }
     msg("Signing in…", true);
-    firebase.auth().signInWithEmailAndPassword(em.value.trim(), pw.value)
+    // remembered on this device until he signs out (the default, made
+    // explicit so a browser quirk cannot downgrade it to session-only)
+    var persist = firebase.auth.Auth && firebase.auth.Auth.Persistence
+      ? firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL)
+      : Promise.resolve();
+    persist.catch(function () {}).then(function () {
+      return firebase.auth().signInWithEmailAndPassword(em.value.trim(), pw.value);
+    })
       .then(function () { pw.value = ""; msg("Signed in — loading…", true);
                           boot(); })
       .catch(function (e) { msg("Sign-in failed: " + (e && e.message || e)); });
