@@ -794,6 +794,37 @@ function installShim() {
     forget: brainForget,
     has: function () { return !!lsGet(LS.brain); }
   };
+  // Build 76: content that rides the brain (game reviews, his own line
+  // extensions) is ciphertext under the same content key as app.enc.
+  // The page never holds the raw key - it hands {n, c} here and gets the
+  // plaintext back; seal() is the reverse for what the page writes.
+  // Wire format: gzip(utf-8 JSON) -> AES-256-GCM (12-byte nonce) -> base64.
+  var vaultKey = null;
+  function vaultCryptoKey() {
+    if (!vaultKey) vaultKey = rawKey(K);
+    return vaultKey;
+  }
+  window.ripVault = {
+    ready: function () { return !!K; },
+    open: function (wrap) {
+      return vaultCryptoKey().then(function (key) {
+        return gcmDecrypt(key, wrap);
+      }).then(function (plain) {
+        return new Response(
+          new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"))
+        ).text();
+      });
+    },
+    seal: function (text) {
+      return new Response(
+        new Blob([te(text)]).stream().pipeThrough(new CompressionStream("gzip"))
+      ).arrayBuffer().then(function (gz) {
+        return vaultCryptoKey().then(function (key) {
+          return gcmEncrypt(key, new Uint8Array(gz));
+        });
+      });
+    }
+  };
 }
 
 function launch(plainBuf) {
